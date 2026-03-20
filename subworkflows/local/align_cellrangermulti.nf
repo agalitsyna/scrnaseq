@@ -6,6 +6,9 @@ include { CELLRANGER_MKREF                  } from "../../modules/nf-core/cellra
 include { CELLRANGER_MKVDJREF               } from "../../modules/nf-core/cellranger/mkvdjref/main.nf"
 include { CELLRANGER_MULTI                  } from "../../modules/nf-core/cellranger/multi/main.nf"
 include { PARSE_CELLRANGERMULTI_SAMPLESHEET } from "../../modules/local/parse_cellrangermulti_samplesheet.nf"
+// Modules for Velocyto launch:
+include { VELOCYTO } from "../../modules/nf-core/velocyto/main.nf"
+include { SAMTOOLS_SORT } from '../../modules/nf-core/samtools/sort/main'
 
 // Define workflow to subset and index a genome region fasta file
 workflow CELLRANGER_MULTI_ALIGN {
@@ -241,6 +244,33 @@ workflow CELLRANGER_MULTI_ALIGN {
         ch_matrices_filtered = parse_demultiplexed_output_channels( CELLRANGER_MULTI.out.outs, "filtered_feature_bc_matrix" )
         ch_matrices_raw      = parse_demultiplexed_output_channels( CELLRANGER_MULTI.out.outs, "raw_feature_bc_matrix"      )
 
+        // Run Velocyto on the output if requested by --run_velocyto true:
+        if ( params.run_velocyto ) {
+
+            ch_velocyto_files = parse_cellrangermulti_velocyto_inputs( CELLRANGER_MULTI.out.outs )
+            ch_fasta_for_sort = ch_fasta.map { fa -> [ [id: 'genome'], fa ] }
+            ch_no_index    = Channel.value('')
+
+            SAMTOOLS_SORT(
+                ch_velocyto_files.map { meta, barcodes, bam -> [ meta, bam ] },
+                ch_fasta_for_sort,
+                ch_no_index
+            )
+
+            ch_velocyto_input =
+                ch_velocyto_files
+                    .join(SAMTOOLS_SORT.out.bam)
+                    .map { meta, barcodes, bam, sorted_bam ->
+                        [ meta + [input_type: 'velocyto'], barcodes, bam, sorted_bam ]
+                    }
+
+            VELOCYTO(
+                ch_velocyto_input,
+                ch_gtf
+            )
+            ch_versions = ch_versions.mix(VELOCYTO.out.versions)
+        }
+
     emit:
         ch_versions
         cellrangermulti_out          = CELLRANGER_MULTI.out.outs
@@ -272,4 +302,38 @@ def parse_demultiplexed_output_channels(in_ch, pattern) {
     .groupTuple( by: 0 ) // group it back as one file collection per sample
 
     return out_ch
+}
+
+def parse_cellrangermulti_velocyto_inputs(in_ch) {
+
+    def ch_bam =
+        in_ch
+        .flatMap { meta, outs ->
+            outs.findAll { it.toString().contains('per_sample_outs') && it.toString().endsWith('/sample_alignments.bam') }
+                .collect { bam ->
+                    def sample_id  = bam.toString().split('/per_sample_outs/')[1].split('/')[0]
+                    def meta_clone = meta.clone()
+                    meta_clone.id  = sample_id
+                    [ sample_id, meta_clone, bam ]
+                }
+        }
+
+    def ch_barcodes =
+        in_ch
+        .flatMap { meta, outs ->
+            outs.findAll { it.toString().contains('per_sample_outs') && it.toString().endsWith('/sample_raw_feature_bc_matrix/barcodes.tsv.gz') }
+                .collect { bc ->
+                    def sample_id = bc.toString().split('/per_sample_outs/')[1].split('/')[0]
+                    [ sample_id, bc ]
+                }
+        }
+
+    ch_merged =
+        ch_bam
+            .join(ch_barcodes)
+            .map { sample_id, meta_clone, bam, bc ->
+                [ meta_clone, bc, bam ]
+            }
+            
+    return ch_merged
 }
